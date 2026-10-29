@@ -1,360 +1,97 @@
-const { app, BrowserWindow, ipcMain, net, Tray, Menu, nativeImage } = require('electron');
-const path  = require('path');
-const fs    = require('fs');
-const { spawn, exec } = require('child_process');
-const dgram = require('dgram');
-const http  = require('http');
-
-let mainWindow;
-let tray = null;
-let currentGameName = null;
-const runningProcesses = new Map();
-
-// ── Game cache ────────────────────────────────────────────────────────────────
-let gameCache     = [];   // { id, name, winExes } — for UDP/HTTP matching
-let rawGamesCache = null; // raw API array — returned to renderer
-
-// ── Path helpers ──────────────────────────────────────────────────────────────
-function getRunnerPath() {
-  if (app.isPackaged) return path.join(process.resourcesPath, 'runner.exe');
-  return path.join(__dirname, '../../assets/runner.exe');
+const { app, BrowserWindow, ipcMain, net, Tray, Menu, nativeImage, dialog, shell } = require('electron');
+const path = require('node:path');
+const fs = require('node:fs');
+const { pathToFileURL } = require('node:url');
+const { Persistence } = require('./persistence');
+const { StorageManager } = require('./storage-manager');
+const { ProcessManager } = require('./process-manager');
+const { DiscordGames } = require('./discord-games');
+const { QueueManager } = require('./queue-manager');
+const { ApplicationService } = require('./service');
+const { RemoteControl } = require('./remote-control');
+const { defaults } = require('./config');
+app.setName('MyGamesThing');
+if (process.env.MGT_TEST_USER_DATA) app.setPath('userData', process.env.MGT_TEST_USER_DATA);
+let window, tray, service, queue, db, remote, quitting = false, timer;
+let chain = Promise.resolve();
+function serial(fn) { const result = chain.then(fn); chain = result.catch(error => db?.log('command.error', { error: error.message })); return result; }
+const page = path.join(__dirname, '../renderer/index.html');
+function show() { window?.show(); window?.focus(); }
+function publish() {
+  if (!service || !window || window.isDestroyed()) return;
+  window.webContents.send('mgt:state', service.snapshot());
+  if (tray) tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Show MyGamesThing', click: show },
+    { label: queue.current()?.game.name || 'No active game', enabled: false }, { type: 'separator' },
+    { label: queue.state.status === 'paused' ? 'Resume' : 'Pause', enabled: ['running', 'waiting', 'paused'].includes(queue.state.status), click: () => serial(() => queue.state.status === 'paused' ? queue.start() : queue.pause()).catch(report) },
+    { label: 'Skip', enabled: ['running', 'waiting', 'paused'].includes(queue.state.status), click: () => serial(() => queue.skip()).catch(report) },
+    { label: 'Stop rotation', click: () => serial(() => queue.stop()).catch(report) },
+    { type: 'separator' }, { label: 'Quit', click: () => app.quit() },
+  ]));
 }
-
-function getIconPath() {
-  return path.join(__dirname, '../../assets/icon.png');
-}
-
-// ── Process helpers ───────────────────────────────────────────────────────────
-function killAllProcesses() {
-  runningProcesses.forEach(({ child }) => { try { child.kill(); } catch {} });
-  runningProcesses.clear();
-}
-
-// ── Tray ──────────────────────────────────────────────────────────────────────
-function updateTrayMenu() {
-  if (!tray) return;
-  const menu = Menu.buildFromTemplate([
-    { label: 'Show PresencePal', click: () => { mainWindow?.show(); mainWindow?.focus(); } },
-    { type: 'separator' },
-    {
-      label: currentGameName ? `Playing: ${currentGameName}` : 'Not playing',
-      enabled: false,
-    },
-    { type: 'separator' },
-    { label: 'Quit', click: () => { app.isQuiting = true; killAllProcesses(); app.quit(); } },
-  ]);
-  tray.setContextMenu(menu);
-}
-
-function createTray() {
-  const icon = nativeImage.createFromPath(getIconPath()).resize({ width: 16, height: 16 });
-  tray = new Tray(icon);
-  tray.setToolTip('PresencePal');
-  updateTrayMenu();
-  tray.on('click',        () => { mainWindow?.show(); mainWindow?.focus(); });
-  tray.on('double-click', () => { mainWindow?.show(); mainWindow?.focus(); });
-}
-
-// ── Window ────────────────────────────────────────────────────────────────────
+function report(error) { db?.log('error', { error: error.stack || error.message }); if (window && !window.isDestroyed()) window.webContents.send('mgt:error', error.message); }
 function createWindow() {
-  mainWindow = new BrowserWindow({
-    width: 900,
-    height: 680,
-    minWidth: 760,
-    minHeight: 560,
-    frame: false,
-    transparent: false,
-    backgroundColor: '#0d0d0f',
-    webPreferences: {
-      preload: path.join(__dirname, '../preload/index.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
-  });
-  mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
+  window = new BrowserWindow({ width: 1280, height: 850, minWidth: 980, minHeight: 650, show: false, title: 'MyGamesThing', backgroundColor: '#101215', autoHideMenuBar: true, icon: path.join(__dirname, '../../assets/icon.png'), webPreferences: { preload: path.join(__dirname, '../preload/index.js'), contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false } });
+  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  window.webContents.on('will-navigate', event => event.preventDefault());
+  window.webContents.session.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
+  window.webContents.on('render-process-gone', (_event, details) => db.log('renderer.gone', details));
+  window.on('close', event => { if (!quitting && service.settings.closeToTray) { event.preventDefault(); window.hide(); if (!service.settings.continueInTray) serial(() => queue.pause()).catch(report); } });
+  window.on('minimize', () => { if (service.settings.minimizeToTray) { window.hide(); if (!service.settings.continueInTray) serial(() => queue.pause()).catch(report); } });
+  window.once('ready-to-show', () => { if (!service.settings.startMinimized || process.env.MGT_SMOKE) show(); });
+  window.loadFile(page);
 }
-
-// ── Exe selection (mirrors renderer logic) ────────────────────────────────────
-const BAD_EXE = /launcher|crash|helper|redist|uninstall/i;
-
-function exeBasename(name) {
-  return name.replace(/\\/g, '/').split('/').pop();
-}
-
-function pickBestExe(winExes) {
-  if (!winExes || winExes.length === 0) return null;
-  const good       = winExes.filter(e => !BAD_EXE.test(exeBasename(e.name)) && !e.is_launcher);
-  const pool       = good.length > 0 ? good : winExes.filter(e => !e.is_launcher);
-  const candidates = pool.length > 0 ? pool : winExes;
-  return candidates.reduce((a, b) =>
-    exeBasename(a.name).length <= exeBasename(b.name).length ? a : b
-  );
-}
-
-// ── Game matching (for UDP / HTTP) ────────────────────────────────────────────
-function normalizeStr(s) {
-  return s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
-function findGame(query) {
-  if (!gameCache.length) return null;
-  const q = normalizeStr(query);
-  let match = gameCache.find(g => normalizeStr(g.name) === q);
-  if (match) return match;
-  match = gameCache.find(g => normalizeStr(g.name).startsWith(q));
-  if (match) return match;
-  match = gameCache.find(g => normalizeStr(g.name).includes(q));
-  if (match) return match;
-  const qTokens = q.split(' ').filter(Boolean);
-  let best = null, bestScore = 0;
-  for (const g of gameCache) {
-    const gTokens = normalizeStr(g.name).split(' ').filter(Boolean);
-    const overlap = qTokens.filter(t => gTokens.includes(t)).length;
-    const score   = overlap / Math.max(qTokens.length, gTokens.length);
-    if (score > bestScore) { bestScore = score; best = g; }
-  }
-  return bestScore >= 0.5 ? best : null;
-}
-
-// ── Shared launch / stop ──────────────────────────────────────────────────────
-async function doLaunchGame({ appId, exeName, exePath, gameName }) {
-  const userData = app.getPath('userData');
-  const fullPath = exePath || exeName;
-  const dirPart  = path.dirname(fullPath);
-  const subdir   = dirPart !== '.' ? dirPart : exeName.replace(/\.exe$/i, '');
-  const gameDir  = path.join(userData, 'games', String(appId), subdir);
-
-  const existing = runningProcesses.get(String(appId));
-  if (existing) {
-    try { existing.child.kill(); } catch {}
-    runningProcesses.delete(String(appId));
-  }
-  await new Promise(resolve => exec(`taskkill /F /IM "${exeName}"`, () => resolve()));
-
-  try { fs.mkdirSync(gameDir, { recursive: true }); }
-  catch (err) { return { success: false, error: `Could not create folder: ${err.message}` }; }
-
-  const runnerSrc = getRunnerPath();
-  if (!fs.existsSync(runnerSrc)) {
-    return { success: false, error: `runner.exe not found at: ${runnerSrc}` };
-  }
-
-  const targetExe = path.join(gameDir, exeName);
-  try { fs.copyFileSync(runnerSrc, targetExe); }
-  catch (err) { return { success: false, error: `Could not copy runner: ${err.message}` }; }
-
-  try {
-    const child = spawn(targetExe, ['--title', gameName], {
-      cwd: gameDir,
-      detached: false,
-      windowsHide: false,
+if (!app.requestSingleInstanceLock()) app.quit();
+else {
+  app.on('second-instance', show);
+  app.whenReady().then(async () => {
+    db = new Persistence(app.getPath('userData')); db.log('startup', { version: app.getVersion() });
+    const saved = { ...structuredClone(defaults), ...db.read('settings', defaults) };
+    const runner = app.isPackaged ? path.join(process.resourcesPath, 'runner.exe') : path.join(__dirname, '../../assets/runner.exe');
+    const storage = new StorageManager(db, process.env.LOCALAPPDATA || app.getPath('userData'), runner);
+    await storage.discover();
+    let storageError = '';
+    try { storage.initialize(saved.storageParent); } catch (error) { storageError = error.message; storage.initialize(''); saved.storageParent = ''; }
+    const processes = new ProcessManager(db, storage); await processes.recover();
+    queue = new QueueManager(db, processes);
+    const catalog = new DiscordGames(db, (...args) => net.fetch(...args));
+    service = new ApplicationService({ db, storage, queue, catalog, settings: saved, dialog, shell, window: () => window }); service.notice = storageError;
+    remote = new RemoteControl(service, serial, db); if (saved.remoteControl) remote.start(); service.remote = remote;
+    queue.on('change', publish);
+    ipcMain.handle('mgt:command', async (event, command, args) => {
+      if (event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || event.senderFrame.url !== pathToFileURL(page).href) throw new Error('Untrusted IPC sender.');
+      try {
+        // Native dialogs must not hold the queue transition lock while awaiting the user.
+        if (command === 'play' && ['running', 'waiting', 'paused'].includes(queue.state.status) && !await service.confirm('Replace the current session?', 'The current game will stop.')) return { ok: true, value: false };
+        if (command === 'clean' && !await service.confirm(args?.all ? 'Delete all generated executables?' : 'Clean unused generated executables?', 'Only files tracked by MyGamesThing in the current storage root will be deleted.')) return { ok: true, value: null };
+        if (command === 'clear-history' && !await service.confirm('Clear history?', 'This removes the local history records.')) return { ok: true, value: queue.history };
+        return { ok: true, value: await (['snapshot', 'library', 'history', 'presets', 'refresh', 'remote-info', 'pick-storage', 'export-history'].includes(command) ? service.command(command, args) : serial(() => service.command(command, args))) };
+      }
+      catch (error) { db.log('ipc.error', { command, error: error.message }); return { ok: false, error: error.message }; }
+      finally { publish(); }
     });
-    runningProcesses.set(String(appId), { child, exeName });
-    child.on('exit', () => runningProcesses.delete(String(appId)));
-    currentGameName = gameName;
-    updateTrayMenu();
-    return { success: true };
-  } catch (err) {
-    return { success: false, error: `Failed to launch: ${err.message}` };
-  }
-}
-
-async function doStopGame({ appId, exeName }) {
-  try {
-    await new Promise((resolve, reject) =>
-      exec(`taskkill /F /IM "${exeName}"`, err => err ? reject(err) : resolve())
-    );
-  } catch {
-    const stored = runningProcesses.get(String(appId));
-    if (stored?.child) { try { stored.child.kill(); } catch {} }
-  }
-  runningProcesses.delete(String(appId));
-  currentGameName = null;
-  updateTrayMenu();
-  return { success: true };
-}
-
-// ── Game fetching + caching ───────────────────────────────────────────────────
-async function fetchAndCacheGames() {
-  try {
-    const res = await net.fetch('https://discord.com/api/v9/applications/detectable');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const games = await res.json();
-    rawGamesCache = games;
-    gameCache = games
-      .map(g => ({
-        id:      g.id,
-        name:    g.name,
-        winExes: (g.executables || [])
-          .filter(e => e.os === 'win32')
-          .sort((a, b) => (a.is_launcher ? 1 : 0) - (b.is_launcher ? 1 : 0)),
-      }))
-      .filter(g => g.winExes.length > 0);
-    return { success: true, games };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
-}
-
-// ── IPC: fetch-games ──────────────────────────────────────────────────────────
-ipcMain.handle('fetch-games', async () => {
-  if (rawGamesCache) return { success: true, games: rawGamesCache };
-  return fetchAndCacheGames();
-});
-
-// ── IPC: launch-game ──────────────────────────────────────────────────────────
-ipcMain.handle('launch-game', async (_, args) => doLaunchGame(args));
-
-// ── IPC: stop-game ────────────────────────────────────────────────────────────
-ipcMain.handle('stop-game', async (_, args) => doStopGame(args));
-
-// ── Window controls ───────────────────────────────────────────────────────────
-ipcMain.on('window-minimize', () => mainWindow?.minimize());
-ipcMain.on('window-close',    () => mainWindow?.hide());
-
-// ── Tray game name update ─────────────────────────────────────────────────────
-ipcMain.on('set-tray-game', (_, gameName) => {
-  currentGameName = gameName || null;
-  updateTrayMenu();
-});
-
-// ── UDP listener (port 41234) ─────────────────────────────────────────────────
-// { action: "play", game: "..." } | { action: "stop" } | { action: "status" }
-
-let udpSocket = null;
-
-function startUdpListener() {
-  udpSocket = dgram.createSocket('udp4');
-
-  udpSocket.on('message', async (msg, rinfo) => {
-    let data;
-    try { data = JSON.parse(msg.toString()); } catch { return; }
-
-    let response;
-
-    if (data.action === 'play' && data.game) {
-      if (!gameCache.length) await fetchAndCacheGames();
-      const game = findGame(data.game);
-      if (!game) {
-        response = { success: false, error: `Game not found: ${data.game}` };
-      } else {
-        const exe = pickBestExe(game.winExes);
-        if (!exe) {
-          response = { success: false, error: 'No executable found for game' };
-        } else {
-          response = await doLaunchGame({
-            appId: game.id, exeName: exeBasename(exe.name), exePath: exe.name, gameName: game.name,
-          });
-          if (response.success) response.game = game.name;
-        }
-      }
-    } else if (data.action === 'stop') {
-      const keys = [...runningProcesses.keys()];
-      if (keys.length) {
-        const stored = runningProcesses.get(keys[0]);
-        response = await doStopGame({ appId: keys[0], exeName: stored.exeName });
-      } else {
-        response = { success: true, message: 'Nothing running' };
-      }
-    } else if (data.action === 'status') {
-      response = { success: true, playing: currentGameName || null };
-    } else {
-      response = { success: false, error: 'Unknown action' };
-    }
-
-    const buf = Buffer.from(JSON.stringify(response));
-    udpSocket.send(buf, rinfo.port, rinfo.address);
+    createWindow();
+    tray = new Tray(nativeImage.createFromPath(path.join(__dirname, '../../assets/icon.png')).resize({ width: 16, height: 16 }));
+    tray.setToolTip('MyGamesThing'); tray.on('click', show); publish();
+    let ticking = false;
+    timer = setInterval(() => { if (!ticking) { ticking = true; serial(() => queue.tick()).catch(report).finally(() => { ticking = false; publish(); }); } }, 500);
+    catalog.load().then(() => { service.catalogReady = true; if (!window.isDestroyed()) window.webContents.send('mgt:catalog'); publish(); }).catch(report);
+    if (process.env.MGT_SMOKE) window.webContents.once('did-finish-load', async () => {
+      try {
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        const result = await window.webContents.executeJavaScript('({title:document.title,bridge:typeof window.mgt?.command,nav:document.querySelectorAll("nav button").length,heading:document.querySelector("h1")?.textContent,error:document.querySelector("#toast.error")?.textContent})');
+        db.log('smoke.renderer', result);
+        if (result.title !== 'MyGamesThing' || result.bridge !== 'function' || result.nav !== 5 || !result.heading || result.error) throw new Error(`Renderer smoke test failed: ${JSON.stringify(result)}`);
+        if (process.env.MGT_CAPTURE) fs.writeFileSync(process.env.MGT_CAPTURE, (await window.webContents.capturePage()).toPNG());
+        fs.writeFileSync(path.join(db.root, 'smoke-result.json'), JSON.stringify(result));
+      } catch (error) { report(error); process.exitCode = 1; }
+      setTimeout(() => app.quit(), 1500);
+    });
+  }).catch(error => { dialog.showErrorBox('MyGamesThing could not start', error.message); app.exit(1); });
+  app.on('window-all-closed', () => { if (!service?.settings.closeToTray) app.quit(); });
+  app.on('before-quit', event => {
+    if (quitting) return;
+    event.preventDefault(); clearInterval(timer);
+    serial(async () => { await queue?.pause(); await service?.queue.processes.stop(); remote?.stop(); quitting = true; db?.log('shutdown'); app.quit(); }).catch(error => { report(error); dialog.showErrorBox('Could not safely stop the generated process', error.message); });
   });
-
-  udpSocket.bind(41234, '0.0.0.0');
 }
-
-// ── HTTP relay server (port 41235) ────────────────────────────────────────────
-// GET /play?game=...   GET /stop   GET /status
-
-let httpServer = null;
-
-function setCorsHeaders(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Content-Type', 'application/json');
-}
-
-function startHttpServer() {
-  httpServer = http.createServer(async (req, res) => {
-    setCorsHeaders(res);
-    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
-
-    const url   = new URL(req.url, 'http://localhost');
-    const route = url.pathname;
-
-    if (route === '/play') {
-      const gameName = url.searchParams.get('game') || '';
-      if (!gameName) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ success: false, error: 'game param required' }));
-        return;
-      }
-      if (!gameCache.length) await fetchAndCacheGames();
-      const game = findGame(gameName);
-      if (!game) {
-        res.writeHead(404);
-        res.end(JSON.stringify({ success: false, error: `Game not found: ${gameName}` }));
-        return;
-      }
-      const exe = pickBestExe(game.winExes);
-      if (!exe) {
-        res.writeHead(500);
-        res.end(JSON.stringify({ success: false, error: 'No executable found for game' }));
-        return;
-      }
-      const result = await doLaunchGame({
-        appId: game.id, exeName: exeBasename(exe.name), exePath: exe.name, gameName: game.name,
-      });
-      if (result.success) result.game = game.name;
-      res.writeHead(result.success ? 200 : 500);
-      res.end(JSON.stringify(result));
-
-    } else if (route === '/stop') {
-      const keys = [...runningProcesses.keys()];
-      let result;
-      if (keys.length) {
-        const stored = runningProcesses.get(keys[0]);
-        result = await doStopGame({ appId: keys[0], exeName: stored.exeName });
-      } else {
-        result = { success: true, message: 'Nothing running' };
-      }
-      res.writeHead(200);
-      res.end(JSON.stringify(result));
-
-    } else if (route === '/status') {
-      res.writeHead(200);
-      res.end(JSON.stringify({ success: true, playing: currentGameName || null }));
-
-    } else {
-      res.writeHead(404);
-      res.end(JSON.stringify({ success: false, error: 'Not found' }));
-    }
-  });
-
-  httpServer.listen(41235, '0.0.0.0');
-}
-
-// ── Boot ──────────────────────────────────────────────────────────────────────
-app.whenReady().then(() => {
-  createWindow();
-  createTray();
-  fetchAndCacheGames();
-  startUdpListener();
-  startHttpServer();
-});
-
-app.on('window-all-closed', () => {
-  // Stay in tray — only quit via tray menu
-});
-
-app.on('before-quit', () => {
-  killAllProcesses();
-  try { udpSocket?.close();  } catch {}
-  try { httpServer?.close(); } catch {}
-});

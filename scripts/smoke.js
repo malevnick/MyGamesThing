@@ -1,0 +1,11 @@
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const root = fs.mkdtempSync(path.join(os.tmpdir(),'mgt-smoke-'));
+fs.writeFileSync(path.join(root,'settings.json'),JSON.stringify({storageParent:root}));
+const env = { ...process.env, MGT_SMOKE:'1', MGT_TEST_USER_DATA:root }; delete env.ELECTRON_RUN_AS_NODE;
+const child = spawn(require('electron'),['.'],{env,stdio:'inherit',windowsHide:true});
+const timeout = setTimeout(()=>{ child.kill(); console.error('Smoke test timed out:',root); process.exitCode=1; },45000);
+child.on('error',error=>{ clearTimeout(timeout); console.error(error); process.exitCode=1; });
+child.on('exit',code=>{ clearTimeout(timeout); const file=path.join(root,'smoke-result.json'); if(code || !fs.existsSync(file)) {console.error('Smoke test failed. Logs:',root);process.exitCode=1;}else console.log('Electron renderer smoke passed:',fs.readFileSync(file,'utf8')); });

@@ -1,3 +1,5 @@
+> Historical PresencePal document retained for reference. MyGamesThing architecture and current behavior are documented in README.md.
+
 ---
 name: PresencePal
 description: Set your Discord game activity to any game — mobile titles included.

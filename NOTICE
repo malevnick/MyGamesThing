@@ -1,0 +1,16 @@
+MyGamesThing is based on / derived from PresencePal by foxmanhwa.
+Original repository: https://github.com/foxmanhwa/presencepal
+Base revision: a95717c872d1122b44a8661409364b33135772e2
+
+The upstream README declares "MIT (c) foxmanhwa" and package.json declares MIT.
+No separate LICENSE file was present at that revision. This distribution
+includes the standard MIT text and preserves the upstream copyright notice.
+
+assets/runner.exe is retained from the original project.
+assets/icon.svg and assets/icon.png are original MyGamesThing artwork,
+released under the project's MIT license.
+The runner binary is distributed as provided upstream; its source is not
+included in the upstream repository at the above revision.
+
+The original author does not endorse this derivative application.
+MyGamesThing is an unofficial Discord utility, not affiliated with Discord.
