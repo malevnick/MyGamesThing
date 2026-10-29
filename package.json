@@ -1,6 +1,6 @@
 {
   "name": "mygamesthing", "version": "0.1.0",
-  "description": "A Windows Discord game activity manager and rotator, derived from PresencePal",
+  "description": "MyGamesThing",
   "author": "MyGamesThing contributors", "license": "MIT", "main": "src/main/index.js",
   "scripts": { "start": "electron .", "check": "node scripts/check.js", "test": "node --test tests/*.test.js", "smoke": "node scripts/smoke.js", "build": "npm run check && npm test && electron-builder --win --x64", "build:dir": "electron-builder --win --x64 --dir" },
   "devDependencies": { "electron": "45.1.0", "electron-builder": "26.18.0" },
